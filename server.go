@@ -6,6 +6,8 @@
 package grpc_prometheus
 
 import (
+	"sync"
+
 	prom "github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
 )
@@ -21,14 +23,10 @@ var (
 
 	// StreamServerInterceptor is a gRPC server-side interceptor that provides Prometheus monitoring for Streaming RPCs.
 	StreamServerInterceptor = DefaultServerMetrics.StreamServerInterceptor()
-)
 
-func init() {
-	prom.MustRegister(DefaultServerMetrics.serverStartedCounter)
-	prom.MustRegister(DefaultServerMetrics.serverHandledCounter)
-	prom.MustRegister(DefaultServerMetrics.serverStreamMsgReceived)
-	prom.MustRegister(DefaultServerMetrics.serverStreamMsgSent)
-}
+	defaultServerMetricsPromRegistration   = map[prom.Registerer]struct{}{}
+	defaultServerMetricsPromRegistrationMu sync.Mutex
+)
 
 // Register takes a gRPC server and pre-initializes all counters to 0. This
 // allows for easier monitoring in Prometheus (no missing metrics), and should
@@ -40,9 +38,65 @@ func Register(server *grpc.Server) {
 
 // EnableHandlingTimeHistogram turns on recording of handling time
 // of RPCs. Histogram metrics can be very expensive for Prometheus
-// to retain and query. This function acts on the DefaultServerMetrics
-// variable and the default Prometheus metrics registry.
+// to retain and query. This function acts on the DefaultServerMetrics.
 func EnableHandlingTimeHistogram(opts ...HistogramOption) {
 	DefaultServerMetrics.EnableHandlingTimeHistogram(opts...)
-	prom.Register(DefaultServerMetrics.serverHandledHistogram)
+}
+
+func RegisterDefaultServerMetricsWithRegisterer(reg prom.Registerer) (alreadyRegistered bool, err error) {
+	defaultServerMetricsPromRegistrationMu.Lock()
+
+	if _, ok := defaultServerMetricsPromRegistration[reg]; ok {
+		defaultServerMetricsPromRegistrationMu.Unlock()
+
+		alreadyRegistered = true
+
+		return
+	}
+
+	registeredMetrics := make([]prom.Collector, 0, 5)
+
+	defer func() {
+		if err != nil {
+			for i := 0; i < len(registeredMetrics); i++ {
+				reg.Unregister(registeredMetrics[i])
+			}
+
+			defaultServerMetricsPromRegistrationMu.Unlock()
+
+			return
+		}
+
+		defaultServerMetricsPromRegistration[reg] = struct{}{}
+		defaultServerMetricsPromRegistrationMu.Unlock()
+	}()
+
+	if err = reg.Register(DefaultServerMetrics.serverStartedCounter); err != nil {
+		return
+	}
+	registeredMetrics = append(registeredMetrics, DefaultServerMetrics.serverStartedCounter)
+
+	if err = reg.Register(DefaultServerMetrics.serverHandledCounter); err != nil {
+		return
+	}
+	registeredMetrics = append(registeredMetrics, DefaultServerMetrics.serverHandledCounter)
+
+	if err = reg.Register(DefaultServerMetrics.serverStreamMsgReceived); err != nil {
+		return
+	}
+	registeredMetrics = append(registeredMetrics, DefaultServerMetrics.serverStreamMsgReceived)
+
+	if err = reg.Register(DefaultServerMetrics.serverStreamMsgSent); err != nil {
+		return
+	}
+	registeredMetrics = append(registeredMetrics, DefaultServerMetrics.serverStreamMsgSent)
+
+	if DefaultServerMetrics.serverHandledHistogramEnabled && DefaultServerMetrics.serverHandledHistogram != nil {
+		if err = reg.Register(DefaultServerMetrics.serverHandledHistogram); err != nil {
+			return
+		}
+		registeredMetrics = append(registeredMetrics, DefaultServerMetrics.serverHandledHistogram)
+	}
+
+	return
 }
